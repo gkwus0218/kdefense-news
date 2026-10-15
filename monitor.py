@@ -36,14 +36,52 @@ TIMEOUT = 20
 
 # Non-exclusive source targets: foreign general news and specialist defense press.
 SOURCES = {
+    # International newspapers and wire services.
     "reuters.com", "bloomberg.com", "ft.com", "nikkei.com", "asia.nikkei.com",
-    "apnews.com", "bbc.com", "theguardian.com", "economist.com", "wsj.com",
-    "straitstimes.com", "scmp.com", "japantimes.co.jp",
+    "apnews.com", "bbc.com", "bbc.co.uk", "theguardian.com", "economist.com",
+    "wsj.com", "nytimes.com", "washingtonpost.com", "politico.com",
+    "straitstimes.com", "scmp.com", "japantimes.co.jp", "thejakartapost.com",
+    "inquirer.net", "philstar.com", "rappler.com", "bangkokpost.com",
+    "thestar.com.my", "nst.com.my", "daily-sun.com", "dailysabah.com",
+    "aa.com.tr", "aljazeera.com", "dw.com", "france24.com", "lemonde.fr",
+    "thehindu.com", "hindustantimes.com", "economictimes.indiatimes.com",
+    "english.news.cn", "businessinsider.com", "abc.net.au", "smh.com.au",
+    # Defense and aerospace specialist outlets.
     "defensenews.com", "breakingdefense.com", "janes.com", "defenseone.com",
-    "defence24.pl", "rzeczpospolita.pl", "wnp.pl", "infodefensa.com",
-    "edrmagazine.eu", "navalnews.com", "armyrecognition.com", "flightglobal.com",
-    "thedefensepost.com", "defence-blog.com", "asiapacificdefencereporter.com.au",
+    "defence24.pl", "defence24.com", "rzeczpospolita.pl", "rp.pl", "wnp.pl",
+    "infodefensa.com", "edrmagazine.eu", "navalnews.com", "armyrecognition.com",
+    "flightglobal.com", "thedefensepost.com", "defence-blog.com",
+    "asiapacificdefencereporter.com.au", "defence-industry.eu", "milmag.pl",
+    "naval-technology.com", "army-technology.com", "defenceweb.co.za",
+    "military.com", "thedrive.com", "defensemirror.com", "defence-ua.com",
+    "euro-sd.com", "defenceconnect.com.au", "defense-aerospace.com",
+    "aviationweek.com", "airforce-technology.com", "breakingdefense.com",
 }
+
+# Only use this mapping if the Google News RSS record explicitly supplies this
+# publisher name. Never infer the publisher from its Google News redirect URL.
+SOURCE_ALIASES = {
+    "reuters": "reuters.com", "bloomberg": "bloomberg.com",
+    "financial times": "ft.com", "nikkei asia": "asia.nikkei.com",
+    "nikkei": "nikkei.com", "associated press": "apnews.com",
+    "ap news": "apnews.com", "bbc": "bbc.com", "the guardian": "theguardian.com",
+    "the wall street journal": "wsj.com", "the new york times": "nytimes.com",
+    "the washington post": "washingtonpost.com", "politico": "politico.com",
+    "the straits times": "straitstimes.com", "south china morning post": "scmp.com",
+    "the japan times": "japantimes.co.jp", "the jakarta post": "thejakartapost.com",
+    "the philippine star": "philstar.com", "inquirer.net": "inquirer.net",
+    "the bangkok post": "bangkokpost.com", "the star": "thestar.com.my",
+    "defense news": "defensenews.com", "defence news": "defensenews.com",
+    "breaking defense": "breakingdefense.com", "janes": "janes.com",
+    "janes defence": "janes.com", "defense one": "defenseone.com",
+    "defence24": "defence24.pl", "rzeczpospolita": "rzeczpospolita.pl",
+    "infodefensa": "infodefensa.com", "naval news": "navalnews.com",
+    "army recognition": "armyrecognition.com", "flightglobal": "flightglobal.com",
+    "the defense post": "thedefensepost.com", "defence blog": "defence-blog.com",
+    "the war zone": "thedrive.com", "aviation week": "aviationweek.com",
+    "defence industry europe": "defence-industry.eu",
+}
+
 # Targeted searches keep GDELT requests small and more robust.
 QUERIES = [
     '("Hanwha Aerospace" OR "Hanwha Ocean" OR "Hyundai Rotem" OR "Korea Aerospace Industries")',
@@ -52,8 +90,13 @@ QUERIES = [
     '("South Korea" OR "Korean") ("arms export" OR "defense contract" OR "weapons deal")',
     '("Hanhwa" OR "Hanwha" OR "Hyundai Rotem") (Poland OR Europe OR export)',
 ]
+# Publisher-provided RSS endpoints. The previous armyrecognition.com/.../rss
+# endpoint returned HTML and failed to parse on GitHub Actions.
 DIRECT_RSS_FEEDS = [
-    "https://www.armyrecognition.com/news/army-news/feed/rss",
+    "https://breakingdefense.com/feed/",
+    "https://www.navalnews.com/feed/",
+    "https://www.defensenews.com/arc/outboundfeeds/rss/?outputType=xml",
+    "https://www.bbc.co.uk/news/world/rss.xml",
 ]
 RSS_QUERIES = [
     '"Hanwha Aerospace" OR "Hanwha Ocean" OR "Hyundai Rotem"',
@@ -156,35 +199,58 @@ def from_gdelt():
 
 def parse_news_feed(content):
     feed = feedparser.parse(content)
-    if getattr(feed, "bozo", False) and not feed.entries:
-        raise ValueError("Invalid RSS response")
+    if not feed.entries and getattr(feed, "bozo", False):
+        error = str(getattr(feed, "bozo_exception", "invalid feed"))[:160]
+        raise ValueError(f"Invalid RSS/Atom feed: {error}")
     return feed
 
 
+def google_publisher(entry):
+    """Return (approved publisher domain, display title) or ('', title).
+
+    Google RSS article links usually point to news.google.com and MUST NOT be
+    treated as a publisher. Prefer its <source url='...'> field, then a
+    curated exact-match fallback based on the publisher's displayed name.
+    """
+    source = entry.get("source") or {}
+    name = html.unescape(str(source.get("title") or "")).strip()
+    website = str(source.get("href") or source.get("url") or "")
+    host = (urlparse(website).hostname or "").lower().removeprefix("www.")
+    if is_approved_source(host):
+        return host, name
+    alias = SOURCE_ALIASES.get(re.sub(r"\s+", " ", name.casefold()))
+    if alias:
+        return alias, name
+    return "", name
+
+
 def from_google_rss():
-    """Collect RSS entries while preserving explicit approved foreign publisher filtering."""
+    """Google News RSS: accept approved publisher metadata, not Google links."""
     results = []
     for i, query in enumerate(RSS_QUERIES, 1):
         try:
-            resp = SESSION.get("https://news.google.com/rss/search", params={"q": query + " when:1d", "hl": "en-US", "gl": "US", "ceid": "US:en"}, timeout=TIMEOUT)
+            resp = SESSION.get("https://news.google.com/rss/search", params={"q": query + " when:2d", "hl": "en-US", "gl": "US", "ceid": "US:en"}, timeout=TIMEOUT)
             resp.raise_for_status()
             feed = parse_news_feed(resp.content)
             accepted = 0
+            rejected = []
             for entry in feed.entries:
-                source = entry.get("source") or {}
-                source_url = source.get("href", "")
-                source_domain = urlparse(source_url).netloc
-                if not is_approved_source(source_domain):
+                source_domain, source_title = google_publisher(entry)
+                if not source_domain:
+                    if len(rejected) < 6:
+                        raw_source = entry.get("source") or {}
+                        rejected.append(f"{source_title or '(no name)'} [{(raw_source.get('href') or '')[:65]}]")
                     continue
                 title = entry.get("title", "")
-                source_title = source.get("title", "")
                 if source_title and title.endswith(" - " + source_title):
                     title = title[: -(len(source_title) + 3)]
                 results.append({"title": title, "url": entry.get("link", ""), "domain": source_domain, "published": entry.get("published", ""), "description": "", "origin": "Google News RSS"})
                 accepted += 1
             LOG.info("Google RSS query %d: %d feed items, %d approved-source items", i, len(feed.entries), accepted)
+            if not accepted and rejected:
+                LOG.warning("Google RSS query %d sample excluded publishers: %s", i, "; ".join(rejected))
         except (requests.RequestException, ValueError) as exc:
-            LOG.warning("Google RSS query %d failed: %s", i, type(exc).__name__)
+            LOG.warning("Google RSS query %d failed: %s: %s", i, type(exc).__name__, str(exc)[:140])
         time.sleep(.5)
     LOG.info("Google RSS provider: %d articles accepted", len(results))
     return results
@@ -200,6 +266,8 @@ def from_direct_rss():
         try:
             resp = SESSION.get(feed_url, timeout=TIMEOUT)
             resp.raise_for_status()
+            if resp.content[:400].lstrip().lower().startswith((b"<!doctype html", b"<html")):
+                raise ValueError("Publisher returned an HTML web page, not an RSS feed")
             feed = parse_news_feed(resp.content)
             accepted = 0
             for entry in feed.entries[:100]:
@@ -210,7 +278,7 @@ def from_direct_rss():
                 accepted += 1
             LOG.info("Publisher RSS %s: %d feed items, %d accepted", domain, len(feed.entries), accepted)
         except (requests.RequestException, ValueError) as exc:
-            LOG.warning("Publisher RSS %s failed: %s", domain, type(exc).__name__)
+            LOG.warning("Publisher RSS %s failed: %s: %s", domain, type(exc).__name__, str(exc)[:140])
     LOG.info("Publisher RSS provider: %d articles accepted", len(results))
     return results
 
@@ -278,8 +346,8 @@ def run_once(db, force_send=False):
     # Only mark first run as seeded if at least one provider actually returned articles.
     first = db.execute("SELECT value FROM meta WHERE name='initialized'").fetchone() is None
     if not articles:
-        LOG.warning("No feed articles received at all: not initializing; check source logs above, will retry next run.")
-        return
+        LOG.error("No feed articles received: news monitoring is NOT healthy. Check the source logs above.")
+        raise RuntimeError("All news sources returned 0 accepted feed articles")
     if first and SEED_ON_FIRST_RUN and not force_send:
         for key, article in candidates:
             db.execute("INSERT OR IGNORE INTO sent VALUES (?, ?, ?, ?)", (key, article['title'], article['url'], now.isoformat()))
