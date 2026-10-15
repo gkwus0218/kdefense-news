@@ -26,6 +26,9 @@ POLL_MINUTES = max(5, int(os.getenv("POLL_MINUTES", "15")))
 LOOKBACK_HOURS = max(1, min(48, int(os.getenv("LOOKBACK_HOURS", "6"))))
 SEED_ON_FIRST_RUN = os.getenv("SEED_ON_FIRST_RUN", "true").lower() == "true"
 ENABLE_GOOGLE_RSS = os.getenv("ENABLE_GOOGLE_RSS", "true").lower() == "true"
+# Disabled by default: GDELT DOC frequently rate-limits shared GitHub runner IPs.
+ENABLE_GDELT = os.getenv("ENABLE_GDELT", "false").lower() == "true"
+ENABLE_DIRECT_RSS = os.getenv("ENABLE_DIRECT_RSS", "true").lower() == "true"
 MIN_SCORE = int(os.getenv("MIN_SCORE", "3"))
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "KDefenseMonitor/1.0 (+personal-research-news-alerts)"})
@@ -48,6 +51,9 @@ QUERIES = [
     '("K2 Black Panther" OR "K9 Thunder" OR "FA-50" OR "KF-21")',
     '("South Korea" OR "Korean") ("arms export" OR "defense contract" OR "weapons deal")',
     '("Hanhwa" OR "Hanwha" OR "Hyundai Rotem") (Poland OR Europe OR export)',
+]
+DIRECT_RSS_FEEDS = [
+    "https://www.armyrecognition.com/news/army-news/feed/rss",
 ]
 RSS_QUERIES = [
     '"Hanwha Aerospace" OR "Hanwha Ocean" OR "Hyundai Rotem"',
@@ -116,46 +122,96 @@ def parse_dt(value):
         return None
 
 def from_gdelt():
+    """Optional GDELT source; one 429 stops the batch to respect server throttling."""
     endpoint = "https://api.gdeltproject.org/api/v2/doc/doc"
     found = []
-    for q in QUERIES:
+    for i, q in enumerate(QUERIES, 1):
         try:
             r = SESSION.get(endpoint, params={"query": q, "mode": "artlist", "format": "json", "sort": "datedesc", "timespan": f"{LOOKBACK_HOURS}h", "maxrecords": 100}, timeout=TIMEOUT)
+            if r.status_code == 429:
+                LOG.warning("GDELT rate-limited (429). Stopping GDELT requests for this run.")
+                break
             r.raise_for_status()
-            for a in r.json().get("articles", []):
+            content_type = r.headers.get("Content-Type", "")
+            try:
+                payload = r.json()
+            except ValueError:
+                LOG.warning("GDELT returned non-JSON response for query %s (type=%s)", i, content_type)
+                continue
+            added = 0
+            for a in payload.get("articles", []):
                 url = a.get("url", "")
                 domain = a.get("domain") or urlparse(url).netloc
-                if not url.startswith("https://") and not url.startswith("http://"):
-                    continue
-                if not is_approved_source(domain):
+                if not url.startswith(("https://", "http://")) or not is_approved_source(domain):
                     continue
                 found.append({"title": a.get("title", ""), "url": url, "domain": domain, "published": a.get("seendate", ""), "description": "", "origin": "GDELT"})
-        except (requests.RequestException, ValueError) as exc:
-            LOG.warning("GDELT query failed: %s (%s)", q[:45], exc)
+                added += 1
+            LOG.info("GDELT query %d: %d approved-source items", i, added)
+        except requests.RequestException as exc:
+            LOG.warning("GDELT query %d failed (%s)", i, type(exc).__name__)
         time.sleep(1.0)
+    LOG.info("GDELT provider: %d articles accepted", len(found))
     return found
 
+
+def parse_news_feed(content):
+    feed = feedparser.parse(content)
+    if getattr(feed, "bozo", False) and not feed.entries:
+        raise ValueError("Invalid RSS response")
+    return feed
+
+
 def from_google_rss():
+    """Collect RSS entries while preserving explicit approved foreign publisher filtering."""
     results = []
-    for query in RSS_QUERIES:
+    for i, query in enumerate(RSS_QUERIES, 1):
         try:
             resp = SESSION.get("https://news.google.com/rss/search", params={"q": query + " when:1d", "hl": "en-US", "gl": "US", "ceid": "US:en"}, timeout=TIMEOUT)
             resp.raise_for_status()
-            feed = feedparser.parse(resp.content)
+            feed = parse_news_feed(resp.content)
+            accepted = 0
             for entry in feed.entries:
-                source = entry.get("source", {})
-                source_url = source.get("href", "") if isinstance(source, dict) else ""
+                source = entry.get("source") or {}
+                source_url = source.get("href", "")
                 source_domain = urlparse(source_url).netloc
                 if not is_approved_source(source_domain):
                     continue
                 title = entry.get("title", "")
-                source_title = source.get("title", "") if isinstance(source, dict) else ""
+                source_title = source.get("title", "")
                 if source_title and title.endswith(" - " + source_title):
                     title = title[: -(len(source_title) + 3)]
-                results.append({"title": title, "url": entry.get("link", ""), "domain": source_domain, "published": entry.get("published", ""), "description": re.sub(r"<[^>]*>", " ", entry.get("summary", "")), "origin": "Google News RSS"})
-        except requests.RequestException as exc:
-            LOG.warning("RSS query failed: %s", exc)
+                results.append({"title": title, "url": entry.get("link", ""), "domain": source_domain, "published": entry.get("published", ""), "description": "", "origin": "Google News RSS"})
+                accepted += 1
+            LOG.info("Google RSS query %d: %d feed items, %d approved-source items", i, len(feed.entries), accepted)
+        except (requests.RequestException, ValueError) as exc:
+            LOG.warning("Google RSS query %d failed: %s", i, type(exc).__name__)
         time.sleep(.5)
+    LOG.info("Google RSS provider: %d articles accepted", len(results))
+    return results
+
+
+def from_direct_rss():
+    """A first-party publisher feed provides fallback when search aggregators throttle."""
+    results = []
+    for feed_url in DIRECT_RSS_FEEDS:
+        domain = urlparse(feed_url).netloc
+        if not is_approved_source(domain):
+            continue
+        try:
+            resp = SESSION.get(feed_url, timeout=TIMEOUT)
+            resp.raise_for_status()
+            feed = parse_news_feed(resp.content)
+            accepted = 0
+            for entry in feed.entries[:100]:
+                url = entry.get("link", "")
+                if not url.startswith(("https://", "http://")):
+                    continue
+                results.append({"title": entry.get("title", ""), "url": url, "domain": domain, "published": entry.get("published", ""), "description": "", "origin": "Publisher RSS"})
+                accepted += 1
+            LOG.info("Publisher RSS %s: %d feed items, %d accepted", domain, len(feed.entries), accepted)
+        except (requests.RequestException, ValueError) as exc:
+            LOG.warning("Publisher RSS %s failed: %s", domain, type(exc).__name__)
+    LOG.info("Publisher RSS provider: %d articles accepted", len(results))
     return results
 
 def setup_db():
@@ -194,9 +250,14 @@ def get_chat_id():
     print("Found chat IDs:", ", ".join(ids) if ids else "none; open bot and send /start then retry")
 
 def run_once(db, force_send=False):
-    articles = from_gdelt()
+    articles = []
     if ENABLE_GOOGLE_RSS:
         articles.extend(from_google_rss())
+    if ENABLE_DIRECT_RSS:
+        articles.extend(from_direct_rss())
+    if ENABLE_GDELT:
+        articles.extend(from_gdelt())
+    LOG.info("Source collection completed: %d raw articles", len(articles))
     now = datetime.now(timezone.utc)
     earliest = now - timedelta(hours=LOOKBACK_HOURS)
     candidates = {}
@@ -213,10 +274,11 @@ def run_once(db, force_send=False):
         if key not in candidates or (article['origin'] == 'GDELT' and candidates[key]['origin'] != 'GDELT'):
             candidates[key] = article
     candidates = list(candidates.items())
+    LOG.info("Relevant matches in last %s hours: %d", LOOKBACK_HOURS, len(candidates))
     # Only mark first run as seeded if at least one provider actually returned articles.
     first = db.execute("SELECT value FROM meta WHERE name='initialized'").fetchone() is None
     if not articles:
-        LOG.warning("No results returned by providers. Skipping initialization; retry later.")
+        LOG.warning("No feed articles received at all: not initializing; check source logs above, will retry next run.")
         return
     if first and SEED_ON_FIRST_RUN and not force_send:
         for key, article in candidates:
