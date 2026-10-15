@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: "Send Telegram test message only (skip news search)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -28,7 +34,14 @@ jobs:
           cache: 'pip'
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+      - name: Send Telegram test message
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_telegram }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py --test-telegram
       - name: Look for new articles and send Telegram alerts
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.test_telegram) }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -36,10 +49,12 @@ jobs:
           LOOKBACK_HOURS: '6'
           SEED_ON_FIRST_RUN: 'true'
           ENABLE_GOOGLE_RSS: 'true'
+          ENABLE_DIRECT_RSS: 'true'
+          ENABLE_GDELT: 'false'
           MIN_SCORE: '3'
         run: python monitor.py
       - name: Persist seen article IDs across workflow runs
-        if: always()
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.test_telegram) }}
         run: |
           if [ ! -f data/articles.db ]; then
             echo 'No database generated; nothing to save.'
